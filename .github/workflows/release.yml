@@ -22,6 +22,7 @@ env:
   DESKTOP_ASSET: allan-security-desktop-x86_64-pc-windows-msvc.exe
   CLI_ASSET: allan-security-cli-x86_64-pc-windows-msvc.exe
   UPDATER_ASSET: allan-security-updater-x86_64-pc-windows-msvc.exe
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   package:
@@ -54,7 +55,7 @@ jobs:
       - name: Assemble release files
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = "$env:RELEASE_TAG".TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist\rules | Out-Null
           Copy-Item target\release\allan-security-desktop.exe "dist\$env:DESKTOP_ASSET"
           Copy-Item target\release\allan-security-cli.exe "dist\$env:CLI_ASSET"
@@ -68,7 +69,7 @@ jobs:
             $manifestAssets += [ordered]@{ name = $asset; sha256 = $hash }
           }
           $manifest = [ordered]@{
-            version = "${{ github.ref_name }}"
+            version = $env:RELEASE_TAG
             repository = "${{ github.repository }}"
             assets = $manifestAssets
           }
@@ -80,7 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $tag = $env:RELEASE_TAG
           gh release create $tag --repo "${{ github.repository }}" --draft --title "Allan Security $tag" --generate-notes
           gh release upload $tag dist\$env:DESKTOP_ASSET dist\$env:CLI_ASSET dist\$env:UPDATER_ASSET dist\allan-security-rules.zip dist\allan-security-manifest.json dist\SHA256SUMS.txt --repo "${{ github.repository }}" --clobber
           gh release edit $tag --repo "${{ github.repository }}" --draft=false
