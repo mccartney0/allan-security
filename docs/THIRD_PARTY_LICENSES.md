@@ -8,6 +8,8 @@ O workspace usa dependências de código aberto gerenciadas pelo Cargo. A lista 
 | `eframe` e `egui` | Interface desktop | MIT / Apache-2.0 |
 | `rusqlite` e SQLite bundled | Banco local de assinaturas | MIT / public domain, conforme upstream |
 | `yara-x` | Compilação e execução de regras YARA defensivas | BSD-3-Clause |
+| `notify` | Notificações de filesystem para proteção em tempo real | CC0-1.0 |
+| `ctrlc` | Encerramento limpo do monitor CLI | MIT / Apache-2.0 |
 | `reqwest` e `rustls` | Consulta HTTPS à API do GitHub e downloads | MIT / Apache-2.0 |
 | `sha2`, `hex`, `serde` | Hashes, serialização e manifest | MIT / Apache-2.0 |
 

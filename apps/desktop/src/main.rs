@@ -7,11 +7,13 @@ use rfd::FileDialog;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
+    time::Duration,
 };
 
 const REPOSITORY: &str = "mccartney0/allan-security";
 const DESKTOP_ASSET: &str = "allan-security-desktop-x86_64-pc-windows-msvc.exe";
+const CLI_ASSET: &str = "allan-security-cli-x86_64-pc-windows-msvc.exe";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -36,6 +38,8 @@ struct AllanApp {
     latest_release: Option<String>,
     update_message: String,
     update_available: bool,
+    realtime_child: Option<Child>,
+    realtime_message: String,
 }
 
 impl AllanApp {
@@ -58,6 +62,8 @@ impl AllanApp {
             latest_release: None,
             update_message: String::new(),
             update_available: false,
+            realtime_child: None,
+            realtime_message: String::new(),
         }
     }
 
@@ -174,6 +180,49 @@ impl AllanApp {
         }
     }
 
+    fn realtime_cli_path() -> Option<PathBuf> {
+        let parent = env::current_exe().ok()?.parent()?.to_path_buf();
+        [CLI_ASSET, "allan-security-cli.exe"]
+            .iter()
+            .map(|name| parent.join(name))
+            .find(|path| path.exists())
+    }
+
+    fn toggle_realtime(&mut self) {
+        if let Some(mut child) = self.realtime_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.realtime_message = "Proteção em tempo real desativada".to_string();
+            self.status = "Protegido — monitoramento em tempo real desligado".to_string();
+            return;
+        }
+        let Some(cli) = Self::realtime_cli_path() else {
+            self.realtime_message =
+                "CLI de monitoramento não encontrado ao lado do desktop".to_string();
+            return;
+        };
+        match Command::new(cli).arg("realtime").spawn() {
+            Ok(child) => {
+                self.realtime_child = Some(child);
+                self.realtime_message =
+                    "Proteção em tempo real ativada para Downloads e Desktop".to_string();
+                self.status = "Protegido — monitoramento em tempo real ativo".to_string();
+            }
+            Err(error) => {
+                self.realtime_message = format!("Falha ao iniciar proteção em tempo real: {error}")
+            }
+        }
+    }
+
+    fn poll_realtime(&mut self) {
+        let result = self.realtime_child.as_mut().map(|child| child.try_wait());
+        if let Some(Ok(Some(status))) = result {
+            self.realtime_child = None;
+            self.realtime_message = format!("Monitoramento encerrado ({status})");
+            self.status = "Protegido — monitoramento em tempo real desligado".to_string();
+        }
+    }
+
     fn launch_update(&mut self, ctx: &egui::Context) {
         let Ok(current_exe) = env::current_exe() else {
             self.update_message = "Caminho do executável não encontrado".to_string();
@@ -224,6 +273,8 @@ impl AllanApp {
 
 impl eframe::App for AllanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_realtime();
+        ctx.request_repaint_after(Duration::from_millis(500));
         let background = egui::Color32::from_rgb(14, 20, 30);
         let panel = egui::Color32::from_rgb(24, 33, 47);
         let accent = egui::Color32::from_rgb(71, 196, 145);
@@ -247,10 +298,12 @@ impl eframe::App for AllanApp {
                     ui.label(&self.status);
                 });
                 ui.horizontal(|ui| {
+                    let active = self.realtime_child.is_some();
                     ui.label("Proteção em tempo real:");
-                    ui.colored_label(egui::Color32::YELLOW, "MVP: não implementada");
-                    ui.label("O MVP não instala driver nem Windows Service.");
+                    ui.colored_label(if active { accent } else { egui::Color32::YELLOW }, if active { "ATIVADA" } else { "DESATIVADA" });
+                    if ui.button(if active { "Desativar" } else { "Ativar" }).clicked() { self.toggle_realtime(); }
                 });
+                ui.label("Modo user-mode: observa Downloads/Desktop sem driver e sem executar arquivos.");
             });
             ui.add_space(12.0);
 
@@ -266,6 +319,7 @@ impl eframe::App for AllanApp {
                 if self.update_available && ui.button("Atualizar agora").clicked() { self.launch_update(ctx); }
             });
             if !self.update_message.is_empty() { ui.label(&self.update_message); }
+            if !self.realtime_message.is_empty() { ui.label(&self.realtime_message); }
             if let Some(path) = &self.selected_path { ui.label(format!("Alvo: {}", path.display())); }
             ui.add_space(12.0);
 

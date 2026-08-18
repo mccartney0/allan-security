@@ -1,3 +1,4 @@
+use allan_core::realtime::{RealtimeConfig, RealtimeMonitor};
 use allan_core::{
     default_data_dir, latest_release, release_is_newer, seed_demo_signatures, unique_reasons,
     QuarantineManager, ScanEngine, SignatureDatabase, YaraEngine, EICAR_TEST_STRING, VERSION,
@@ -6,6 +7,10 @@ use anyhow::{anyhow, Context, Result};
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 fn main() -> Result<()> {
@@ -40,6 +45,7 @@ fn main() -> Result<()> {
                 print_summary(&summary, false)?;
             }
         }
+        "realtime" => run_realtime(args)?,
         "eicar" => {
             let path = env::temp_dir().join("allan-security-eicar.com");
             fs::write(&path, EICAR_TEST_STRING).context("criando arquivo de teste EICAR")?;
@@ -78,6 +84,41 @@ fn main() -> Result<()> {
         "version" | "--version" => println!("{VERSION}"),
         _ => print_help(),
     }
+    Ok(())
+}
+
+fn run_realtime(args: impl Iterator<Item = String>) -> Result<()> {
+    let custom_paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+    let mut config = RealtimeConfig::quick_paths();
+    if !custom_paths.is_empty() {
+        config.paths = custom_paths;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_handler = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        stop_for_handler.store(true, Ordering::Release);
+    })?;
+    let engine = build_engine()?;
+    let mut monitor = RealtimeMonitor::new(engine, config.clone())?;
+    println!("Proteção em tempo real iniciada. Diretórios:");
+    for path in &config.paths {
+        println!("  {}", path.display());
+    }
+    println!("Pressione Ctrl+C para encerrar de forma limpa.");
+    monitor.run_blocking(stop, |notification| {
+        if let Some(error) = notification.error {
+            eprintln!("[realtime] {}: {}", notification.action, error);
+        } else if notification.summary.threats_found > 0 {
+            eprintln!(
+                "[realtime] ameaça detectada em {}",
+                notification.path.display()
+            );
+            let _ = print_summary(&notification.summary, false);
+        } else {
+            println!("[realtime] verificado: {}", notification.path.display());
+        }
+    })?;
+    println!("Proteção em tempo real encerrada.");
     Ok(())
 }
 
@@ -125,6 +166,7 @@ fn print_help() {
     println!("Allan Security CLI {VERSION}");
     println!("  scan <arquivo-ou-pasta> [--json]  Verificação personalizada");
     println!("  quick-scan                        Downloads, Desktop e temporários");
+    println!("  realtime [pastas...]              Monitorar alterações sem executar arquivos");
     println!("  eicar                             Criar arquivo de teste EICAR sem executar");
     println!("  quarantine <arquivo>              Mover arquivo confirmado para quarentena");
     println!("  check-update [owner/repo]         Consultar a última GitHub Release");

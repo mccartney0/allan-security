@@ -3,6 +3,8 @@
 //! O núcleo nunca executa os arquivos analisados. Ele apenas lê metadados e bytes,
 //! calcula hashes, consulta assinaturas, aplica regras YARA e registra ações explícitas.
 
+pub mod realtime;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use reqwest::blocking::Client;

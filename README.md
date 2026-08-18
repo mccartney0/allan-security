@@ -16,6 +16,19 @@
 
 O fluxo implementado é **selecionar pasta ou arquivo → enumerar → calcular SHA-256 → consultar SQLite → aplicar YARA → classificar → mostrar razões → mover para quarentena somente após ação explícita → registrar histórico**. A regra EICAR é incluída apenas para teste defensivo; ela não representa malware real.
 
+## Proteção em tempo real
+
+O MVP agora possui proteção em tempo real **user-mode** baseada em notificações de filesystem do Windows por meio do crate `notify`, que usa `ReadDirectoryChangesW` no Windows. O monitor observa Downloads e Desktop, normaliza eventos de criação/escrita, aplica debounce, espera o arquivo ficar estável, usa o mesmo `ScanEngine` e registra o resultado em `LOCALAPPDATA\\AllanSecurity\\history.jsonl`. Ele nunca executa o arquivo observado, não instala driver e não desativa o Windows Defender.
+
+A GUI possui o botão **Ativar/Desativar**. Ao ativar, ela inicia o `allan-security-cli.exe realtime` ao lado do desktop; ao desativar, encerra o processo. Também é possível executar diretamente:
+
+```powershell
+cargo run -p allan-security-cli -- realtime
+cargo run -p allan-security-cli -- realtime "C:\\Users\\allan\\AppData\\Local\\Temp"
+```
+
+Esse modo permanece ativo enquanto o processo monitor estiver em execução. Inicialização automática no boot como Windows Service, ACLs reforçadas, recuperação após falha e assinatura Authenticode permanecem no backlog posterior.
+
 ## Como executar no Windows
 
 ```powershell
@@ -43,3 +56,5 @@ A atualização automática não é silenciosa: exige confirmação na interface
 [1]: https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository "GitHub Docs — Managing releases in a repository"
 [2]: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax "GitHub Docs — Workflow syntax for GitHub Actions"
 [3]: https://docs.rs/yara-x/1.19.0/yara_x/ "docs.rs — YARA-X API"
+[4]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw "Microsoft Learn — ReadDirectoryChangesW"
+[5]: https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-directory-change-notifications "Microsoft Learn — Obtaining Directory Change Notifications"
