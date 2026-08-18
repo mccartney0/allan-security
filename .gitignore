@@ -1,0 +1,8 @@
+/target/
+*.log
+*.previous
+*.download
+*.quarantined
+/data/
+.DS_Store
+Thumbs.db

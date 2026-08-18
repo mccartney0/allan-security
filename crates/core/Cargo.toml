@@ -1,0 +1,23 @@
+[package]
+name = "allan-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+yara-x.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

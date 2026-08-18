@@ -1,0 +1,61 @@
+name: CI — Allan Security
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-build:
+    name: Validate and build Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build desktop
+        run: cargo build --release --locked -p allan-security-desktop
+
+      - name: Build CLI
+        run: cargo build --release --locked -p allan-security-cli
+
+      - name: Build updater
+        run: cargo build --release --locked -p allan-security-updater
+
+      - name: Assemble CI package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\rules | Out-Null
+          Copy-Item target\release\allan-security-desktop.exe dist\allan-security-desktop-x86_64-pc-windows-msvc.exe
+          Copy-Item target\release\allan-security-cli.exe dist\allan-security-cli-x86_64-pc-windows-msvc.exe
+          Copy-Item target\release\allan-security-updater.exe dist\allan-security-updater-x86_64-pc-windows-msvc.exe
+          Get-ChildItem rules -Include *.yar,*.yara -File -Recurse | Copy-Item -Destination dist\rules\ -Force
+
+      - name: Upload binaries for this adjustment
+        uses: actions/upload-artifact@v4
+        with:
+          name: allan-security-ci-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,86 @@
+name: Release — Allan Security
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag semântica já existente, por exemplo v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DESKTOP_ASSET: allan-security-desktop-x86_64-pc-windows-msvc.exe
+  CLI_ASSET: allan-security-cli-x86_64-pc-windows-msvc.exe
+  UPDATER_ASSET: allan-security-updater-x86_64-pc-windows-msvc.exe
+
+jobs:
+  package:
+    name: Package Windows x64 release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Validate and test
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+          cargo test --workspace --locked
+
+      - name: Build three apps
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p allan-security-desktop
+          cargo build --release --locked -p allan-security-cli
+          cargo build --release --locked -p allan-security-updater
+
+      - name: Assemble release files
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path dist\rules | Out-Null
+          Copy-Item target\release\allan-security-desktop.exe "dist\$env:DESKTOP_ASSET"
+          Copy-Item target\release\allan-security-cli.exe "dist\$env:CLI_ASSET"
+          Copy-Item target\release\allan-security-updater.exe "dist\$env:UPDATER_ASSET"
+          Get-ChildItem rules -Include *.yar,*.yara -File -Recurse | Copy-Item -Destination dist\rules\ -Force
+          Compress-Archive -Path dist\rules\* -DestinationPath dist\allan-security-rules.zip -Force
+          $assets = @($env:DESKTOP_ASSET, $env:CLI_ASSET, $env:UPDATER_ASSET)
+          $manifestAssets = @()
+          foreach ($asset in $assets) {
+            $hash = (Get-FileHash "dist\$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
+            $manifestAssets += [ordered]@{ name = $asset; sha256 = $hash }
+          }
+          $manifest = [ordered]@{
+            version = "${{ github.ref_name }}"
+            repository = "${{ github.repository }}"
+            assets = $manifestAssets
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content dist\allan-security-manifest.json -Encoding utf8
+          Get-ChildItem dist -File -Recurse | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist\SHA256SUMS.txt
+
+      - name: Create immutable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          gh release create $tag --repo "${{ github.repository }}" --draft --title "Allan Security $tag" --generate-notes
+          gh release upload $tag dist\$env:DESKTOP_ASSET dist\$env:CLI_ASSET dist\$env:UPDATER_ASSET dist\allan-security-rules.zip dist\allan-security-manifest.json dist\SHA256SUMS.txt --repo "${{ github.repository }}" --clobber
+          gh release edit $tag --repo "${{ github.repository }}" --draft=false
