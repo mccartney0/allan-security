@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "allan-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "allan-core",
  "anyhow",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-desktop"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "allan-core",
  "anyhow",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-updater"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "allan-core",
  "anyhow",
