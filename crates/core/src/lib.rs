@@ -918,7 +918,10 @@ mod tests {
         let quarantined = manager.quarantine(&source, &sha).unwrap();
         assert!(!source.exists());
         let restored = manager.restore(&quarantined, Some(&sha)).unwrap();
-        assert_eq!(restored, source);
+        assert_eq!(
+            fs::canonicalize(&restored).unwrap(),
+            fs::canonicalize(&source).unwrap()
+        );
         assert_eq!(fs::read(restored).unwrap(), b"quarantine-fixture");
         assert!(manager.entries().unwrap().is_empty());
     }

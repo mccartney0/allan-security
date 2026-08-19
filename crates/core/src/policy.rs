@@ -186,7 +186,8 @@ fn is_filesystem_root(path: &Path) -> bool {
 }
 
 fn path_key(path: &Path) -> String {
-    let mut value = path
+    let comparable = comparison_path(path);
+    let mut value = comparable
         .to_string_lossy()
         .replace('/', "\\")
         .to_ascii_lowercase();
@@ -199,4 +200,30 @@ fn path_key(path: &Path) -> String {
         value.pop();
     }
     value
+}
+
+fn comparison_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut suffix = Vec::new();
+        let mut existing = path.to_path_buf();
+        while !existing.exists() {
+            let Some(name) = existing.file_name() else {
+                break;
+            };
+            suffix.push(name.to_os_string());
+            if !existing.pop() {
+                break;
+            }
+        }
+        let mut normalized = fs::canonicalize(&existing).unwrap_or(existing);
+        for name in suffix.iter().rev() {
+            normalized.push(name);
+        }
+        normalized
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
