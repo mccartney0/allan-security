@@ -4,6 +4,7 @@
 //! calcula hashes, consulta assinaturas, aplica regras YARA e registra ações explícitas.
 
 pub mod cache;
+pub mod pe;
 pub mod policy;
 pub mod realtime;
 pub mod scheduler;
@@ -15,9 +16,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -71,6 +72,8 @@ pub struct DetectionResult {
     pub yara_matches: Vec<String>,
     pub heuristic_score: u32,
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub pe: Option<crate::pe::PeStaticReport>,
 }
 
 impl DetectionResult {
@@ -611,6 +614,7 @@ impl ScanEngine {
         signature_match: Option<ThreatRecord>,
     ) -> Result<Option<DetectionResult>> {
         let yara_matches = self.yara.scan_bytes(bytes)?;
+        let pe_report = crate::pe::analyze_bytes(bytes)?;
         let mut reasons = Vec::new();
         let mut heuristic_score = 0;
 
@@ -629,6 +633,18 @@ impl ScanEngine {
                 "{} regra(s) YARA correspondida(s)",
                 yara_matches.len()
             ));
+        }
+        if let Some(report) = &pe_report {
+            if matches!(report.status, crate::pe::PeParseStatus::Malformed) {
+                reasons.push(
+                    "estrutura PE malformada observada durante a análise estática".to_string(),
+                );
+            } else if !report.warnings.is_empty() {
+                reasons.push(format!(
+                    "parser PE emitiu {} aviso(s)",
+                    report.warnings.len()
+                ));
+            }
         }
 
         let severity = signature_match
@@ -654,6 +670,7 @@ impl ScanEngine {
             yara_matches,
             heuristic_score,
             reasons,
+            pe: pe_report,
         }))
     }
 }
@@ -737,34 +754,186 @@ pub fn download_verified(url: &str, destination: &Path, expected_sha256: &str) -
     let client = Client::builder()
         .user_agent(format!("{APP_NAME}/{VERSION}"))
         .build()?;
-    let mut response = client.get(url).send()?.error_for_status()?;
+    let response = client.get(url).send()?.error_for_status()?;
+    install_verified_reader(response, destination, expected_sha256)
+}
+
+pub fn install_verified_reader<R: Read>(
+    mut source: R,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
     let temporary = destination.with_extension("download");
-    let mut output = File::create(&temporary)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("criando temporário {}", temporary.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = response.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let write_result = (|| -> Result<()> {
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            output.write_all(&buffer[..read])?;
         }
-        hasher.update(&buffer[..read]);
-        output.write_all(&buffer[..read])?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
-    output.flush()?;
+
     let actual = hex::encode(hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256.trim_start_matches("sha256:")) {
+    if !actual.eq_ignore_ascii_case(expected_sha256.trim().trim_start_matches("sha256:")) {
         let _ = fs::remove_file(&temporary);
         return Err(anyhow!(
             "hash SHA-256 divergente: esperado {expected_sha256}, recebido {actual}"
         ));
     }
-    if destination.exists() {
-        let backup = destination.with_extension("previous");
+
+    let backup = destination.with_extension("previous");
+    let had_destination = destination.exists();
+    if had_destination {
         let _ = fs::remove_file(&backup);
-        fs::rename(destination, &backup)?;
+        if let Err(error) = fs::rename(destination, &backup) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
     }
-    fs::rename(&temporary, destination)?;
+    if let Err(error) = fs::rename(&temporary, destination) {
+        if had_destination {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     Ok(())
+}
+
+pub const HISTORY_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HistorySource {
+    Cli,
+    Desktop,
+    Realtime,
+    Scheduler,
+    Updater,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HistoryAction {
+    ScanCompleted,
+    ThreatDetected,
+    Quarantined,
+    Restored,
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryRecord {
+    pub schema_version: u16,
+    pub timestamp: String,
+    pub source: HistorySource,
+    pub action: HistoryAction,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub summary: Option<ScanSummary>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HistoryRead {
+    pub records: Vec<HistoryRecord>,
+    pub invalid_lines: u64,
+    pub total_lines: u64,
+}
+
+pub fn append_history_record(
+    path: &Path,
+    source: HistorySource,
+    action: HistoryAction,
+    target: Option<&Path>,
+    summary: Option<&ScanSummary>,
+    error: Option<&str>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let record = HistoryRecord {
+        schema_version: HISTORY_SCHEMA_VERSION,
+        timestamp: Utc::now().to_rfc3339(),
+        source,
+        action,
+        path: target.map(Path::to_path_buf),
+        summary: summary.cloned(),
+        error: error.map(str::to_owned),
+    };
+    let line = serde_json::to_string(&record)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    file.flush()?;
+    Ok(())
+}
+
+pub fn read_history(path: &Path, max_records: usize) -> Result<HistoryRead> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryRead::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut result = HistoryRead::default();
+    let limit = max_records.max(1);
+    let mut records = VecDeque::with_capacity(limit.min(1024));
+    for line in BufReader::new(file).lines() {
+        result.total_lines += 1;
+        let line = match line {
+            Ok(line) if !line.trim().is_empty() => line,
+            Ok(_) => continue,
+            Err(_) => {
+                result.invalid_lines += 1;
+                continue;
+            }
+        };
+        let record = serde_json::from_str::<HistoryRecord>(&line).or_else(|_| {
+            serde_json::from_str::<ScanSummary>(&line).map(|summary| HistoryRecord {
+                schema_version: 0,
+                timestamp: String::new(),
+                source: HistorySource::Legacy,
+                action: if summary.threats_found > 0 {
+                    HistoryAction::ThreatDetected
+                } else {
+                    HistoryAction::ScanCompleted
+                },
+                path: None,
+                summary: Some(summary),
+                error: None,
+            })
+        });
+        match record {
+            Ok(record) => {
+                if records.len() == limit {
+                    records.pop_front();
+                }
+                records.push_back(record);
+            }
+            Err(_) => result.invalid_lines += 1,
+        }
+    }
+    result.records = records.into_iter().collect();
+    Ok(result)
 }
 
 pub fn default_data_dir() -> PathBuf {
@@ -937,5 +1106,89 @@ mod tests {
         fs::write(&quarantined, b"tampered").unwrap();
         assert!(manager.restore(&quarantined, Some(&sha)).is_err());
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn updater_installs_verified_bytes_and_keeps_previous() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("allan-security.exe");
+        fs::write(&target, b"old-version").unwrap();
+        let new_bytes = b"new-version";
+        let expected = format!("sha256:{}", sha256_bytes(new_bytes));
+        install_verified_reader(&new_bytes[..], &target, &expected).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), new_bytes);
+        assert_eq!(
+            fs::read(target.with_extension("previous")).unwrap(),
+            b"old-version"
+        );
+        assert!(!target.with_extension("download").exists());
+    }
+
+    #[test]
+    fn updater_rejects_wrong_hash_without_touching_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("allan-security.exe");
+        fs::write(&target, b"stable-version").unwrap();
+        let result =
+            install_verified_reader(&b"untrusted-version"[..], &target, "00".repeat(32).as_str());
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"stable-version");
+        assert!(!target.with_extension("previous").exists());
+        assert!(!target.with_extension("download").exists());
+    }
+
+    #[test]
+    fn updater_refuses_stale_download_without_overwriting_it() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("allan-security.exe");
+        let temporary = target.with_extension("download");
+        fs::write(&target, b"stable-version").unwrap();
+        fs::write(&temporary, b"stale-partial-download").unwrap();
+        let result =
+            install_verified_reader(&b"new-version"[..], &target, &sha256_bytes(b"new-version"));
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"stable-version");
+        assert_eq!(fs::read(&temporary).unwrap(), b"stale-partial-download");
+    }
+
+    #[test]
+    fn history_reader_keeps_recent_records_and_skips_corruption() {
+        let dir = tempdir().unwrap();
+        let history = dir.path().join("history.jsonl");
+        let legacy = serde_json::to_string(&ScanSummary {
+            scanned_files: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        fs::write(&history, format!("{legacy}\nnot-json\n")).unwrap();
+        append_history_record(
+            &history,
+            HistorySource::Cli,
+            HistoryAction::ScanCompleted,
+            None,
+            Some(&ScanSummary {
+                scanned_files: 2,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        append_history_record(
+            &history,
+            HistorySource::Realtime,
+            HistoryAction::Warning,
+            Some(Path::new("C:\\fixture.bin")),
+            None,
+            Some("fixture warning"),
+        )
+        .unwrap();
+
+        let read = read_history(&history, 2).unwrap();
+        assert_eq!(read.total_lines, 4);
+        assert_eq!(read.invalid_lines, 1);
+        assert_eq!(read.records.len(), 2);
+        assert_eq!(read.records[0].source, HistorySource::Cli);
+        assert_eq!(read.records[1].source, HistorySource::Realtime);
+        assert_eq!(read.records[1].error.as_deref(), Some("fixture warning"));
     }
 }

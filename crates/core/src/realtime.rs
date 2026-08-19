@@ -178,7 +178,7 @@ impl RealtimeMonitor {
         }
         match self.engine.scan_path(path) {
             Ok(summary) => {
-                append_history(self.config.history_path.as_deref(), &summary);
+                append_history(self.config.history_path.as_deref(), path, &summary);
                 RealtimeNotification {
                     path: path.to_path_buf(),
                     action: "scan".to_string(),
@@ -230,25 +230,21 @@ fn wait_until_stable(path: &Path, interval: Duration, attempts: u8) -> bool {
     false
 }
 
-fn append_history(path: Option<&Path>, summary: &ScanSummary) {
-    let Some(path) = path else {
+fn append_history(history_path: Option<&Path>, target: &Path, summary: &ScanSummary) {
+    let Some(history_path) = history_path else {
         return;
     };
-    let Some(parent) = path.parent() else {
-        return;
+    let action = if summary.threats_found > 0 {
+        crate::HistoryAction::ThreatDetected
+    } else {
+        crate::HistoryAction::ScanCompleted
     };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(line) = serde_json::to_string(summary) else {
-        return;
-    };
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(format!("{line}\n").as_bytes())
-        });
+    let _ = crate::append_history_record(
+        history_path,
+        crate::HistorySource::Realtime,
+        action,
+        Some(target),
+        Some(summary),
+        None,
+    );
 }

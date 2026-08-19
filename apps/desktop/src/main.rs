@@ -1,15 +1,16 @@
 use allan_core::{
-    cache::ScanCache, default_data_dir, latest_release, policy::ExclusionPolicy, release_is_newer,
-    seed_demo_signatures, DetectionResult, QuarantineEntry, QuarantineManager, ScanEngine,
+    append_history_record, cache::ScanCache, default_data_dir, latest_release,
+    policy::ExclusionPolicy, read_history, release_is_newer, seed_demo_signatures, DetectionResult,
+    HistoryAction, HistoryRecord, HistorySource, QuarantineEntry, QuarantineManager, ScanEngine,
     ScanSummary, SignatureDatabase, YaraEngine, APP_NAME, VERSION,
 };
 use eframe::egui;
 use rfd::FileDialog;
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     process::{Child, Command},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const REPOSITORY: &str = "mccartney0/allan-security";
@@ -47,6 +48,10 @@ struct AllanApp {
     schedule_interval: String,
     schedule_message: String,
     exclusion_extension: String,
+    history_records: Vec<HistoryRecord>,
+    history_invalid_lines: u64,
+    history_filter: String,
+    last_history_refresh: Instant,
 }
 
 impl AllanApp {
@@ -89,6 +94,10 @@ impl AllanApp {
             schedule_interval: "60".to_string(),
             schedule_message: String::new(),
             exclusion_extension: String::new(),
+            history_records: Vec::new(),
+            history_invalid_lines: 0,
+            history_filter: String::new(),
+            last_history_refresh: Instant::now() - Duration::from_secs(10),
         }
     }
 
@@ -319,19 +328,54 @@ impl AllanApp {
     }
 
     fn persist_history(&self, summary: &ScanSummary) {
-        if let Ok(serialized) = serde_json::to_string(summary) {
-            let path = default_data_dir().join("history.jsonl");
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+        let action = if summary.threats_found > 0 {
+            HistoryAction::ThreatDetected
+        } else {
+            HistoryAction::ScanCompleted
+        };
+        let _ = append_history_record(
+            &default_data_dir().join("history.jsonl"),
+            HistorySource::Desktop,
+            action,
+            self.selected_path.as_deref(),
+            Some(summary),
+            None,
+        );
+    }
+
+    fn refresh_history(&mut self) {
+        self.last_history_refresh = Instant::now();
+        match read_history(&default_data_dir().join("history.jsonl"), 200) {
+            Ok(read) => {
+                self.history_records = read.records;
+                self.history_invalid_lines = read.invalid_lines;
             }
-            let _ = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    std::io::Write::write_all(&mut file, format!("{serialized}\n").as_bytes())
-                });
+            Err(error) => {
+                self.history_records.clear();
+                self.history_invalid_lines = 1;
+                self.status = format!("Histórico indisponível: {error}");
+            }
         }
+    }
+
+    fn history_matches(&self, record: &HistoryRecord) -> bool {
+        let filter = self.history_filter.trim().to_ascii_lowercase();
+        if filter.is_empty() {
+            return true;
+        }
+        let path = record
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        [
+            format!("{:?}", record.source),
+            format!("{:?}", record.action),
+            path,
+            record.error.clone().unwrap_or_default(),
+        ]
+        .into_iter()
+        .any(|value| value.to_ascii_lowercase().contains(&filter))
     }
 
     fn check_updates(&mut self) {
@@ -447,6 +491,9 @@ impl eframe::App for AllanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_realtime();
         self.poll_schedule();
+        if self.last_history_refresh.elapsed() >= Duration::from_secs(2) {
+            self.refresh_history();
+        }
         ctx.request_repaint_after(Duration::from_millis(500));
         let background = egui::Color32::from_rgb(14, 20, 30);
         let panel = egui::Color32::from_rgb(24, 33, 47);
@@ -540,7 +587,7 @@ impl eframe::App for AllanApp {
                 });
             }
 
-            egui::CollapsingHeader::new(format!("Quarentena ({} item(ns))" , self.quarantine_items.len()))
+            egui::CollapsingHeader::new(format!("Quarentena ({} item(ns))", self.quarantine_items.len()))
                 .default_open(false)
                 .show(ui, |ui| {
                     if self.quarantine_items.is_empty() {
@@ -555,6 +602,77 @@ impl eframe::App for AllanApp {
                         });
                     }
                 });
+
+            let mut history_refresh_clicked = false;
+            egui::CollapsingHeader::new(format!("Histórico (últimos {} registros)", self.history_records.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filtrar:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.history_filter)
+                                .hint_text("ação, origem, caminho ou erro")
+                                .desired_width(260.0),
+                        );
+                        if ui.button("Atualizar").clicked() {
+                            history_refresh_clicked = true;
+                        }
+                        if self.history_invalid_lines > 0 {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("{} linha(s) inválida(s)", self.history_invalid_lines),
+                            );
+                        }
+                    });
+                    let filtered_indices: Vec<usize> = self
+                        .history_records
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| self.history_matches(record).then_some(index))
+                        .collect();
+                    if filtered_indices.is_empty() {
+                        ui.label("Nenhum registro corresponde ao filtro.");
+                    } else {
+                        let records = &self.history_records;
+                        egui::ScrollArea::vertical()
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, 22.0, filtered_indices.len(), |ui, row_range| {
+                                for row in row_range {
+                                    let record = &records[filtered_indices[row]];
+                                    let target = record
+                                        .path
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .unwrap_or_else(|| "—".to_string());
+                                    let summary = record.summary.as_ref().map(|summary| {
+                                        format!(
+                                            "{} arq.; {} ameaça(s); {} erro(s)",
+                                            summary.scanned_files,
+                                            summary.threats_found,
+                                            summary.errors
+                                        )
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.monospace(if record.timestamp.is_empty() {
+                                            "legado"
+                                        } else {
+                                            &record.timestamp
+                                        });
+                                        ui.label(format!("{:?}/{:?}", record.source, record.action));
+                                        ui.label(target);
+                                        if let Some(summary) = summary.as_deref() {
+                                            ui.label(summary);
+                                        }
+                                        if let Some(error) = &record.error {
+                                            ui.colored_label(egui::Color32::YELLOW, error);
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                });
+            if history_refresh_clicked { self.refresh_history(); }
             if quarantine_clicked { self.quarantine_detections(); }
             if let Some(index) = restore_index { self.restore_quarantine(index); }
         });

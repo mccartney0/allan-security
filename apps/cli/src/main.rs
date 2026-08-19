@@ -3,9 +3,9 @@ use allan_core::policy::ExclusionPolicy;
 use allan_core::realtime::{RealtimeConfig, RealtimeMonitor};
 use allan_core::scheduler::{ScanScheduler, ScheduleConfig};
 use allan_core::{
-    default_data_dir, latest_release, release_is_newer, seed_demo_signatures, unique_reasons,
-    QuarantineManager, ScanEngine, ScanSummary, SignatureDatabase, YaraEngine, EICAR_TEST_STRING,
-    VERSION,
+    append_history_record, default_data_dir, latest_release, pe, release_is_newer,
+    seed_demo_signatures, unique_reasons, HistoryAction, HistorySource, QuarantineManager,
+    ScanEngine, ScanSummary, SignatureDatabase, YaraEngine, EICAR_TEST_STRING, VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use std::{
@@ -49,6 +49,7 @@ fn main() -> Result<()> {
         }
         "schedule" => run_schedule(args)?,
         "realtime" => run_realtime(args)?,
+        "pe-info" => run_pe_info(args)?,
         "eicar" => {
             let path = env::temp_dir().join("allan-security-eicar.com");
             fs::write(&path, EICAR_TEST_STRING).context("criando arquivo de teste EICAR")?;
@@ -159,7 +160,7 @@ fn run_paths(paths: Vec<PathBuf>, use_cache: bool, json: bool) -> Result<ScanSum
         combined.merge(summary);
     }
     print_summary(&combined, json)?;
-    append_history(&combined);
+    append_history(&combined, HistorySource::Cli);
     Ok(combined)
 }
 
@@ -185,6 +186,69 @@ fn parse_scan_options(
         paths = defaults;
     }
     Ok((paths, json, no_cache))
+}
+
+fn run_pe_info(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .ok_or_else(|| anyhow!("uso: allan-security-cli pe-info <arquivo> [--json]"))?;
+    let json = args.any(|arg| arg == "--json");
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path).with_context(|| format!("lendo {}", path.display()))?;
+    if metadata.len() > pe::MAX_PE_BYTES as u64 {
+        return Err(anyhow!(
+            "arquivo excede o limite do parser PE ({} bytes)",
+            pe::MAX_PE_BYTES
+        ));
+    }
+    let bytes = fs::read(&path).with_context(|| format!("abrindo {}", path.display()))?;
+    match pe::analyze_bytes(&bytes)? {
+        None => {
+            if json {
+                println!(
+                    "{{\"path\":{},\"status\":\"not-pe\"}}",
+                    serde_json::to_string(&path)?
+                );
+            } else {
+                println!("{} não é um PE reconhecido.", path.display());
+            }
+        }
+        Some(report) => {
+            pe::validate_report(&report)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("PE: {}", path.display());
+                println!("Status: {:?}", report.status);
+                println!(
+                    "Arquitetura: {} (64-bit: {:?})",
+                    report.architecture, report.is_64
+                );
+                println!("Machine: {:?}", report.machine);
+                println!("Timestamp: {:?}", report.timestamp);
+                println!("Entry point: {:?}", report.entry_point);
+                println!(
+                    "Seções: {} | Imports: {}",
+                    report.sections.len(),
+                    report.imports.len()
+                );
+                for section in &report.sections {
+                    println!(
+                        "  seção {} raw={}+{} RVA={} entropia={:?}",
+                        section.name,
+                        section.raw_offset,
+                        section.raw_size,
+                        section.address,
+                        section.entropy
+                    );
+                }
+                for warning in &report.warnings {
+                    println!("Aviso: {warning}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_schedule(args: impl Iterator<Item = String>) -> Result<()> {
@@ -225,7 +289,7 @@ fn run_schedule(args: impl Iterator<Item = String>) -> Result<()> {
     );
     scheduler.run_blocking(&engine, &mut cache, stop, |summary| {
         let _ = print_summary(&summary, json);
-        append_history(&summary);
+        append_history(&summary, HistorySource::Scheduler);
     })?;
     Ok(())
 }
@@ -343,21 +407,20 @@ fn full_scan_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn append_history(summary: &ScanSummary) {
-    if let Ok(serialized) = serde_json::to_string(summary) {
-        let path = default_data_dir().join("history.jsonl");
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut file| {
-                use std::io::Write;
-                file.write_all(format!("{serialized}\n").as_bytes())
-            });
-    }
+fn append_history(summary: &ScanSummary, source: HistorySource) {
+    let action = if summary.threats_found > 0 {
+        HistoryAction::ThreatDetected
+    } else {
+        HistoryAction::ScanCompleted
+    };
+    let _ = append_history_record(
+        &default_data_dir().join("history.jsonl"),
+        source,
+        action,
+        None,
+        Some(summary),
+        None,
+    );
 }
 
 fn print_summary(summary: &ScanSummary, json: bool) -> Result<()> {
@@ -391,6 +454,7 @@ fn print_help() {
     println!("  full-scan [raízes...] [--no-cache] Varredura de volumes com cache por hash/mtime");
     println!("  schedule [--interval-minutes N]   Varredura agendada e contínua");
     println!("  realtime [pastas...]              Monitorar alterações sem executar arquivos");
+    println!("  pe-info <arquivo> [--json]        Ler PE estaticamente, sem executar");
     println!("  exclusions show|add-path|remove-path|add-ext|remove-ext");
     println!("  quarantine <arquivo>              Mover arquivo confirmado para quarentena");
     println!("  quarantine-list                   Listar metadados de quarentena");

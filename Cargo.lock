@@ -149,12 +149,13 @@ dependencies = [
 
 [[package]]
 name = "allan-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
  "hex",
  "notify",
+ "object 0.40.0",
  "reqwest",
  "rusqlite",
  "semver",
@@ -168,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allan-core",
  "anyhow",
@@ -178,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allan-core",
  "anyhow",
@@ -190,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "allan-security-updater"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allan-core",
  "anyhow",
@@ -3159,6 +3160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4865,7 +4875,7 @@ dependencies = [
  "log",
  "mach2",
  "memfd",
- "object",
+ "object 0.38.1",
  "once_cell",
  "postcard",
  "pulley-interpreter",
@@ -4900,7 +4910,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "log",
- "object",
+ "object 0.38.1",
  "postcard",
  "serde",
  "serde_derive",
@@ -4939,7 +4949,7 @@ dependencies = [
  "gimli 0.33.0",
  "itertools",
  "log",
- "object",
+ "object 0.38.1",
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
@@ -4997,7 +5007,7 @@ dependencies = [
  "cfg-if",
  "cranelift-codegen",
  "log",
- "object",
+ "object 0.38.1",
  "wasmtime-environ",
 ]
 
