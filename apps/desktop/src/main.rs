@@ -1,6 +1,7 @@
 use allan_core::{
-    default_data_dir, latest_release, release_is_newer, seed_demo_signatures, DetectionResult,
-    QuarantineManager, ScanEngine, ScanSummary, SignatureDatabase, YaraEngine, APP_NAME, VERSION,
+    cache::ScanCache, default_data_dir, latest_release, policy::ExclusionPolicy, release_is_newer,
+    seed_demo_signatures, DetectionResult, QuarantineEntry, QuarantineManager, ScanEngine,
+    ScanSummary, SignatureDatabase, YaraEngine, APP_NAME, VERSION,
 };
 use eframe::egui;
 use rfd::FileDialog;
@@ -31,7 +32,9 @@ fn main() -> eframe::Result<()> {
 
 struct AllanApp {
     engine: Option<ScanEngine>,
+    policy: ExclusionPolicy,
     quarantine: Option<QuarantineManager>,
+    quarantine_items: Vec<QuarantineEntry>,
     selected_path: Option<PathBuf>,
     summary: Option<ScanSummary>,
     status: String,
@@ -40,22 +43,40 @@ struct AllanApp {
     update_available: bool,
     realtime_child: Option<Child>,
     realtime_message: String,
+    schedule_child: Option<Child>,
+    schedule_interval: String,
+    schedule_message: String,
+    exclusion_extension: String,
 }
 
 impl AllanApp {
     fn new() -> Self {
         let data_dir = default_data_dir();
-        let (engine, status) = match Self::build_engine() {
+        let (policy, policy_status) = match ExclusionPolicy::load_default() {
+            Ok(policy) => (policy, String::new()),
+            Err(error) => (
+                ExclusionPolicy::default(),
+                format!(" Exclusões não carregadas: {error}"),
+            ),
+        };
+        let (engine, mut status) = match Self::build_engine(&policy) {
             Ok(engine) => (
                 Some(engine),
                 "Protegido — pronto para verificar".to_string(),
             ),
             Err(error) => (None, format!("Inicialização limitada: {error}")),
         };
+        status.push_str(&policy_status);
         let quarantine = QuarantineManager::new(data_dir.join("quarantine")).ok();
+        let quarantine_items = quarantine
+            .as_ref()
+            .and_then(|manager| manager.entries().ok())
+            .unwrap_or_default();
         Self {
             engine,
+            policy,
             quarantine,
+            quarantine_items,
             selected_path: None,
             summary: None,
             status,
@@ -64,10 +85,14 @@ impl AllanApp {
             update_available: false,
             realtime_child: None,
             realtime_message: String::new(),
+            schedule_child: None,
+            schedule_interval: "60".to_string(),
+            schedule_message: String::new(),
+            exclusion_extension: String::new(),
         }
     }
 
-    fn build_engine() -> anyhow::Result<ScanEngine> {
+    fn build_engine(policy: &ExclusionPolicy) -> anyhow::Result<ScanEngine> {
         let data_dir = default_data_dir();
         let db = SignatureDatabase::open(&data_dir.join("signatures.db"))?;
         seed_demo_signatures(&db)?;
@@ -83,7 +108,7 @@ impl AllanApp {
             // A regra inválida é isolada pelo carregador; o dashboard continua operacional.
             let _ = &mut engine;
         }
-        Ok(engine)
+        Ok(engine.with_policy(policy.clone()))
     }
 
     fn scan(&mut self, path: PathBuf) {
@@ -145,6 +170,152 @@ impl AllanApp {
         self.persist_history(&combined);
         self.summary = Some(combined);
         self.selected_path = None;
+    }
+
+    fn full_scan(&mut self) {
+        let Some(engine) = &self.engine else {
+            self.status = "Scanner indisponível".to_string();
+            return;
+        };
+        let roots = full_scan_roots();
+        let mut cache = match ScanCache::open(&ScanCache::default_path()) {
+            Ok(cache) => cache,
+            Err(error) => {
+                self.status = format!("Cache indisponível: {error}");
+                return;
+            }
+        };
+        let engine_key = engine.cache_key();
+        let mut combined = ScanSummary::default();
+        for root in roots {
+            if let Ok(summary) = engine.scan_path_cached(&root, &mut cache, &engine_key) {
+                combined.merge(summary);
+            }
+        }
+        self.status = format!(
+            "Full Scan concluído — {} arquivo(s), {} ameaça(s), {} erro(s)",
+            combined.scanned_files, combined.threats_found, combined.errors
+        );
+        self.persist_history(&combined);
+        self.summary = Some(combined);
+        self.selected_path = None;
+    }
+
+    fn reload_policy(&mut self) {
+        match ExclusionPolicy::load_default().and_then(|policy| {
+            let engine = Self::build_engine(&policy)?;
+            Ok((policy, engine))
+        }) {
+            Ok((policy, engine)) => {
+                self.policy = policy;
+                self.engine = Some(engine);
+                self.status = "Política de exclusões aplicada ao scanner".to_string();
+            }
+            Err(error) => self.status = format!("Política não aplicada: {error}"),
+        }
+    }
+
+    fn add_path_exclusion(&mut self) {
+        let Some(path) = self.selected_path.clone() else {
+            self.status = "Selecione uma pasta antes de excluí-la".to_string();
+            return;
+        };
+        match self
+            .policy
+            .add_path(&path)
+            .and_then(|_| self.policy.save_default())
+        {
+            Ok(()) => {
+                self.reload_policy();
+                self.status = format!("Exclusão adicionada: {}", path.display());
+            }
+            Err(error) => self.status = format!("Exclusão não aplicada: {error}"),
+        }
+    }
+
+    fn add_extension_exclusion(&mut self) {
+        let extension = self.exclusion_extension.trim().to_string();
+        if extension.is_empty() {
+            self.status = "Informe uma extensão, por exemplo .tmp".to_string();
+            return;
+        }
+        match self
+            .policy
+            .add_extension(&extension)
+            .and_then(|_| self.policy.save_default())
+        {
+            Ok(()) => {
+                self.exclusion_extension.clear();
+                self.reload_policy();
+                self.status = format!("Exclusão de extensão adicionada: {extension}");
+            }
+            Err(error) => self.status = format!("Extensão não aplicada: {error}"),
+        }
+    }
+
+    fn refresh_quarantine(&mut self) {
+        if let Some(quarantine) = &self.quarantine {
+            self.quarantine_items = quarantine.entries().unwrap_or_default();
+        }
+    }
+
+    fn restore_quarantine(&mut self, index: usize) {
+        let Some(entry) = self.quarantine_items.get(index).cloned() else {
+            return;
+        };
+        let Some(quarantine) = &self.quarantine else {
+            self.status = "Quarentena indisponível".to_string();
+            return;
+        };
+        match quarantine.restore(&entry.quarantined_path, Some(&entry.sha256)) {
+            Ok(path) => {
+                self.status = format!("Arquivo restaurado por ação explícita: {}", path.display());
+                self.refresh_quarantine();
+            }
+            Err(error) => self.status = format!("Restauração bloqueada: {error}"),
+        }
+    }
+
+    fn scheduler_cli_path() -> Option<PathBuf> {
+        let parent = env::current_exe().ok()?.parent()?.to_path_buf();
+        [CLI_ASSET, "allan-security-cli.exe"]
+            .iter()
+            .map(|name| parent.join(name))
+            .find(|path| path.exists())
+    }
+
+    fn toggle_schedule(&mut self) {
+        if let Some(mut child) = self.schedule_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.schedule_message = "Scheduler desativado".to_string();
+            return;
+        }
+        let Some(cli) = Self::scheduler_cli_path() else {
+            self.schedule_message = "CLI não encontrado ao lado do desktop".to_string();
+            return;
+        };
+        let interval = self.schedule_interval.parse::<u64>().unwrap_or(60).max(1);
+        match Command::new(cli)
+            .args(["schedule", "--interval-minutes"])
+            .arg(interval.to_string())
+            .spawn()
+        {
+            Ok(child) => {
+                self.schedule_child = Some(child);
+                self.schedule_message =
+                    format!("Scheduler ativo: Quick Scan a cada {interval} minuto(s)");
+            }
+            Err(error) => self.schedule_message = format!("Falha ao iniciar scheduler: {error}"),
+        }
+    }
+
+    fn poll_schedule(&mut self) {
+        let result = self.schedule_child.as_mut().map(|child| child.try_wait());
+        if let Some(Ok(Some(status))) = result {
+            self.schedule_child = None;
+            self.schedule_message = format!("Scheduler encerrado ({status})");
+        }
     }
 
     fn persist_history(&self, summary: &ScanSummary) {
@@ -267,6 +438,7 @@ impl AllanApp {
         self.status = format!("{} item(ns) movido(s) para quarentena", moved);
         if moved > 0 {
             self.summary = None;
+            self.refresh_quarantine();
         }
     }
 }
@@ -274,6 +446,7 @@ impl AllanApp {
 impl eframe::App for AllanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_realtime();
+        self.poll_schedule();
         ctx.request_repaint_after(Duration::from_millis(500));
         let background = egui::Color32::from_rgb(14, 20, 30);
         let panel = egui::Color32::from_rgb(24, 33, 47);
@@ -304,11 +477,22 @@ impl eframe::App for AllanApp {
                     if ui.button(if active { "Desativar" } else { "Ativar" }).clicked() { self.toggle_realtime(); }
                 });
                 ui.label("Modo user-mode: observa Downloads/Desktop sem driver e sem executar arquivos.");
+                ui.horizontal(|ui| {
+                    let scheduled = self.schedule_child.is_some();
+                    ui.label("Scheduler:");
+                    ui.add_enabled(!scheduled, egui::TextEdit::singleline(&mut self.schedule_interval).desired_width(48.0));
+                    ui.label("min");
+                    if ui.button(if scheduled { "Desativar scheduler" } else { "Agendar Quick Scan" }).clicked() {
+                        self.toggle_schedule();
+                    }
+                });
             });
             ui.add_space(12.0);
 
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Verificação rápida").clicked() { self.quick_scan(); }
+                if ui.button("Full Scan").clicked() { self.full_scan(); }
+                if ui.button("Excluir pasta selecionada").clicked() { self.add_path_exclusion(); }
                 if ui.button("Selecionar pasta").clicked() {
                     if let Some(path) = FileDialog::new().pick_folder() { self.scan(path); }
                 }
@@ -318,12 +502,18 @@ impl eframe::App for AllanApp {
                 if ui.button("Verificar atualizações").clicked() { self.check_updates(); }
                 if self.update_available && ui.button("Atualizar agora").clicked() { self.launch_update(ctx); }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Excluir extensão:");
+                ui.add(egui::TextEdit::singleline(&mut self.exclusion_extension).hint_text(".tmp").desired_width(90.0));
+                if ui.button("Adicionar exclusão").clicked() { self.add_extension_exclusion(); }
+            });
             if !self.update_message.is_empty() { ui.label(&self.update_message); }
             if !self.realtime_message.is_empty() { ui.label(&self.realtime_message); }
             if let Some(path) = &self.selected_path { ui.label(format!("Alvo: {}", path.display())); }
             ui.add_space(12.0);
 
             let mut quarantine_clicked = false;
+            let mut restore_index = None;
             if let Some(summary) = &self.summary {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -349,7 +539,24 @@ impl eframe::App for AllanApp {
                     ui.label("Escolha uma verificação para começar. O primeiro marco é selecionar → escanear → detectar → quarentenar → registrar.");
                 });
             }
+
+            egui::CollapsingHeader::new(format!("Quarentena ({} item(ns))" , self.quarantine_items.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    if self.quarantine_items.is_empty() {
+                        ui.label("Nenhum item em quarentena.");
+                    }
+                    for (index, entry) in self.quarantine_items.iter().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{} — {}", entry.sha256, entry.original_path.display()));
+                            if ui.button("Restaurar").clicked() {
+                                restore_index = Some(index);
+                            }
+                        });
+                    }
+                });
             if quarantine_clicked { self.quarantine_detections(); }
+            if let Some(index) = restore_index { self.restore_quarantine(index); }
         });
     }
 }
@@ -368,6 +575,20 @@ fn render_detection(ui: &mut egui::Ui, detection: &DetectionResult) {
     for reason in &detection.reasons {
         ui.label(format!("Razão: {reason}"));
     }
+}
+
+fn full_scan_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if root.exists() {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    roots
 }
 
 #[allow(dead_code)]

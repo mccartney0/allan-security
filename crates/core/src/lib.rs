@@ -3,7 +3,10 @@
 //! O núcleo nunca executa os arquivos analisados. Ele apenas lê metadados e bytes,
 //! calcula hashes, consulta assinaturas, aplica regras YARA e registra ações explícitas.
 
+pub mod cache;
+pub mod policy;
 pub mod realtime;
+pub mod scheduler;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -73,6 +76,16 @@ pub struct DetectionResult {
 impl DetectionResult {
     pub fn is_threat(&self) -> bool {
         !matches!(self.severity, Severity::Clean)
+    }
+}
+
+impl ScanSummary {
+    pub fn merge(&mut self, other: Self) {
+        self.scanned_files += other.scanned_files;
+        self.threats_found += other.threats_found;
+        self.errors += other.errors;
+        self.elapsed_ms += other.elapsed_ms;
+        self.detections.extend(other.detections);
     }
 }
 
@@ -260,6 +273,7 @@ pub struct QuarantineManager {
 impl QuarantineManager {
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
+        harden_quarantine_directory(&root)?;
         Ok(Self { root })
     }
 
@@ -279,15 +293,29 @@ impl QuarantineManager {
             .with_context(|| format!("copiando para {}", destination.display()))?;
         let metadata = serde_json::json!({
             "original_path": source,
+            "quarantined_path": destination,
             "sha256": sha256,
             "quarantined_at": Utc::now().to_rfc3339(),
         });
         let sidecar = destination.with_extension("json");
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&sidecar)?;
-        file.write_all(serde_json::to_string_pretty(&metadata)?.as_bytes())?;
+            .open(&sidecar)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&destination);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = file.write_all(serde_json::to_string_pretty(&metadata)?.as_bytes()) {
+            let _ = fs::remove_file(&destination);
+            let _ = fs::remove_file(&sidecar);
+            return Err(error.into());
+        }
+        harden_quarantine_file(&destination)?;
+        harden_quarantine_file(&sidecar)?;
         fs::remove_file(&source)
             .with_context(|| format!("removendo original {}", source.display()))?;
         Ok(destination)
@@ -299,16 +327,228 @@ impl QuarantineManager {
             .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("quarantined"))
             .collect())
     }
+
+    pub fn entries(&self) -> Result<Vec<QuarantineEntry>> {
+        let mut entries = Vec::new();
+        for item in self.list()? {
+            let sidecar = item.with_extension("json");
+            if let Ok(bytes) = fs::read(&sidecar) {
+                if let Ok(mut entry) = serde_json::from_slice::<QuarantineEntry>(&bytes) {
+                    if entry.quarantined_path.as_os_str().is_empty() {
+                        entry.quarantined_path = item.clone();
+                    }
+                    entries.push(entry);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn restore(
+        &self,
+        quarantined_path: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<PathBuf> {
+        let root = fs::canonicalize(&self.root)?;
+        let quarantined = fs::canonicalize(quarantined_path).with_context(|| {
+            format!(
+                "validando item de quarentena {}",
+                quarantined_path.display()
+            )
+        })?;
+        if !quarantined.starts_with(&root)
+            || quarantined
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("quarantined")
+        {
+            return Err(anyhow!("item fora da pasta de quarentena"));
+        }
+        let sidecar = quarantined.with_extension("json");
+        let metadata: QuarantineEntry = serde_json::from_slice(
+            &fs::read(&sidecar)
+                .with_context(|| format!("lendo metadados {}", sidecar.display()))?,
+        )?;
+        let actual_sha256 = sha256_file(&quarantined)?;
+        if !actual_sha256.eq_ignore_ascii_case(&metadata.sha256)
+            || expected_sha256.is_some_and(|expected| !actual_sha256.eq_ignore_ascii_case(expected))
+        {
+            return Err(anyhow!("hash da quarentena não corresponde aos metadados"));
+        }
+        let destination = metadata.original_path;
+        if !destination.is_absolute() || destination.starts_with(&root) {
+            return Err(anyhow!("destino de restauração inválido"));
+        }
+        if destination.exists() {
+            return Err(anyhow!(
+                "o destino original já existe; nenhuma restauração foi aplicada"
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+            let parent = fs::canonicalize(parent)?;
+            if parent.starts_with(&root) {
+                return Err(anyhow!("destino de restauração dentro da quarentena"));
+            }
+        }
+        fs::copy(&quarantined, &destination)
+            .with_context(|| format!("restaurando {}", destination.display()))?;
+        if !sha256_file(&destination)?.eq_ignore_ascii_case(&actual_sha256) {
+            let _ = fs::remove_file(&destination);
+            return Err(anyhow!("verificação pós-restauração falhou"));
+        }
+        fs::remove_file(&quarantined)?;
+        fs::remove_file(&sidecar)?;
+        Ok(normalize_restored_path(destination))
+    }
+}
+
+fn normalize_restored_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineEntry {
+    pub original_path: PathBuf,
+    #[serde(default)]
+    pub quarantined_path: PathBuf,
+    pub sha256: String,
+    pub quarantined_at: String,
+}
+
+#[cfg(windows)]
+fn harden_quarantine_directory(path: &Path) -> Result<()> {
+    run_icacls(path, true)
+}
+
+#[cfg(not(windows))]
+fn harden_quarantine_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn harden_quarantine_file(path: &Path) -> Result<()> {
+    run_icacls(path, false)
+}
+
+#[cfg(not(windows))]
+fn harden_quarantine_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_icacls(path: &Path, directory: bool) -> Result<()> {
+    use std::process::Command;
+    let username = std::env::var("USERNAME").context("USERNAME ausente para ACL da quarentena")?;
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    let principal = if domain.is_empty() {
+        username
+    } else {
+        format!("{domain}\\{username}")
+    };
+    let inheritance = if directory { "(OI)(CI)(F)" } else { "F" };
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{principal}:{inheritance}"))
+        .args([
+            "/grant:r",
+            "*S-1-5-18:F",
+            "/grant:r",
+            "*S-1-5-32-544:F",
+            "/q",
+        ])
+        .output()
+        .with_context(|| format!("executando icacls em {}", path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "icacls não conseguiu endurecer {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 pub struct ScanEngine {
+    policy: crate::policy::ExclusionPolicy,
     signatures: SignatureDatabase,
     yara: YaraEngine,
 }
 
 impl ScanEngine {
     pub fn new(signatures: SignatureDatabase, yara: YaraEngine) -> Self {
-        Self { signatures, yara }
+        Self {
+            signatures,
+            yara,
+            policy: crate::policy::ExclusionPolicy::default(),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: crate::policy::ExclusionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> &crate::policy::ExclusionPolicy {
+        &self.policy
+    }
+
+    pub fn cache_key(&self) -> String {
+        let policy = serde_json::to_vec(&self.policy).unwrap_or_default();
+        format!("{VERSION}:{}", sha256_bytes(&policy))
+    }
+
+    pub fn scan_path_cached(
+        &self,
+        path: &Path,
+        cache: &mut crate::cache::ScanCache,
+        engine_key: &str,
+    ) -> Result<ScanSummary> {
+        let started = Instant::now();
+        let mut summary = ScanSummary::default();
+        let files = if path.is_dir() {
+            collect_files(path)?
+        } else if path.is_file() {
+            vec![path.to_path_buf()]
+        } else {
+            return Err(anyhow!("caminho não encontrado: {}", path.display()));
+        };
+        for file in files {
+            if !self.policy.is_excluded(&file)
+                && cache.lookup_clean(&file, engine_key).unwrap_or(false)
+            {
+                summary.scanned_files += 1;
+                continue;
+            }
+            match self.scan_file(&file) {
+                Ok(Some(detection)) => {
+                    summary.threats_found += 1;
+                    summary.detections.push(detection);
+                    summary.scanned_files += 1;
+                    let _ = cache.invalidate(&file);
+                }
+                Ok(None) => {
+                    summary.scanned_files += 1;
+                    if !self.policy.is_excluded(&file) {
+                        let _ = cache.record_clean(&file, engine_key);
+                    }
+                }
+                Err(_) => summary.errors += 1,
+            }
+        }
+        summary.elapsed_ms = started.elapsed().as_millis();
+        Ok(summary)
     }
 
     pub fn scan_path(&self, path: &Path) -> Result<ScanSummary> {
@@ -343,10 +583,15 @@ impl ScanEngine {
             return Ok(None);
         }
         let bytes = fs::read(path)?;
-        self.scan_bytes(path, metadata.len(), &bytes)
+        let sha256 = sha256_bytes(&bytes);
+        let signature_match = self.signatures.lookup(&sha256)?;
+        if self.policy.is_excluded(path) && signature_match.is_none() {
+            return Ok(None);
+        }
+        self.scan_bytes_with_signature(path, metadata.len(), &bytes, sha256, signature_match)
     }
 
-    fn scan_bytes(
+    pub fn scan_bytes(
         &self,
         path: &Path,
         file_size: u64,
@@ -354,6 +599,17 @@ impl ScanEngine {
     ) -> Result<Option<DetectionResult>> {
         let sha256 = sha256_bytes(bytes);
         let signature_match = self.signatures.lookup(&sha256)?;
+        self.scan_bytes_with_signature(path, file_size, bytes, sha256, signature_match)
+    }
+
+    fn scan_bytes_with_signature(
+        &self,
+        path: &Path,
+        file_size: u64,
+        bytes: &[u8],
+        sha256: String,
+        signature_match: Option<ThreatRecord>,
+    ) -> Result<Option<DetectionResult>> {
         let yara_matches = self.yara.scan_bytes(bytes)?;
         let mut reasons = Vec::new();
         let mut heuristic_score = 0;
@@ -593,5 +849,90 @@ mod tests {
         let engine = YaraEngine::from_dir(&rules).unwrap();
         assert_eq!(engine.scan_bytes(b"safe").unwrap().len(), 0);
         assert_eq!(engine.invalid_rules.len(), 1);
+    }
+
+    #[test]
+    fn exclusion_policy_round_trips_through_json() {
+        let dir = tempdir().unwrap();
+        let excluded_dir = dir.path().join("excluded");
+        fs::create_dir_all(&excluded_dir).unwrap();
+        let policy_path = dir.path().join("exclusions.json");
+        let mut policy = crate::policy::ExclusionPolicy::default();
+        policy.add_path(&excluded_dir).unwrap();
+        policy.add_extension("TMP").unwrap();
+        policy.save(&policy_path).unwrap();
+        let loaded = crate::policy::ExclusionPolicy::load(&policy_path).unwrap();
+        assert_eq!(loaded, policy);
+        assert!(loaded.is_excluded(&excluded_dir.join("nested.bin")));
+        assert!(loaded.is_excluded(Path::new("C:\\work\\file.tmp")));
+    }
+
+    #[test]
+    fn exclusions_suppress_unknown_content_but_not_known_hashes() {
+        let dir = tempdir().unwrap();
+        let db = SignatureDatabase::open(&dir.path().join("signatures.db")).unwrap();
+        let known = b"known-threat";
+        let known_hash = sha256_bytes(known);
+        db.add(&ThreatRecord {
+            sha256: known_hash,
+            name: "fixture".to_string(),
+            family: "test".to_string(),
+            category: "test".to_string(),
+            severity: Severity::High,
+            signature_version: "test".to_string(),
+            source: "unit-test".to_string(),
+        })
+        .unwrap();
+        let rules = dir.path().join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        let mut policy = crate::policy::ExclusionPolicy::default();
+        policy.add_extension(".tmp").unwrap();
+        let engine = ScanEngine::new(db, YaraEngine::from_dir(&rules).unwrap()).with_policy(policy);
+        let clean = dir.path().join("clean.tmp");
+        fs::write(&clean, b"ordinary").unwrap();
+        assert_eq!(engine.scan_path(&clean).unwrap().threats_found, 0);
+        let threat = dir.path().join("threat.tmp");
+        fs::write(&threat, known).unwrap();
+        assert_eq!(engine.scan_path(&threat).unwrap().threats_found, 1);
+    }
+
+    #[test]
+    fn cache_invalidates_when_file_size_changes() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("sample.bin");
+        fs::write(&file, b"clean").unwrap();
+        let mut cache = crate::cache::ScanCache::open(&dir.path().join("cache.db")).unwrap();
+        cache.record_clean(&file, "engine").unwrap();
+        assert!(cache.lookup_clean(&file, "engine").unwrap());
+        fs::write(&file, b"changed-content").unwrap();
+        assert!(!cache.lookup_clean(&file, "engine").unwrap());
+    }
+
+    #[test]
+    fn quarantine_restore_round_trip_is_hash_checked() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("sample.txt");
+        fs::write(&source, b"quarantine-fixture").unwrap();
+        let sha = sha256_file(&source).unwrap();
+        let manager = QuarantineManager::new(dir.path().join("quarantine")).unwrap();
+        let quarantined = manager.quarantine(&source, &sha).unwrap();
+        assert!(!source.exists());
+        let restored = manager.restore(&quarantined, Some(&sha)).unwrap();
+        assert_eq!(restored, source);
+        assert_eq!(fs::read(restored).unwrap(), b"quarantine-fixture");
+        assert!(manager.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quarantine_restore_rejects_tampered_item() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("tampered.txt");
+        fs::write(&source, b"original").unwrap();
+        let sha = sha256_file(&source).unwrap();
+        let manager = QuarantineManager::new(dir.path().join("quarantine")).unwrap();
+        let quarantined = manager.quarantine(&source, &sha).unwrap();
+        fs::write(&quarantined, b"tampered").unwrap();
+        assert!(manager.restore(&quarantined, Some(&sha)).is_err());
+        assert!(!source.exists());
     }
 }

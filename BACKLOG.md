@@ -8,11 +8,11 @@ Este backlog transforma a documentação mestre em incrementos pequenos. Cada it
 | --- | --- | --- | --- |
 | RT-001 | Monitor de filesystem em Downloads/Desktop | Eventos create/write/rename chegam ao mesmo `ScanEngine`, sem executar arquivos, com encerramento limpo e tratamento de erro de permissão. | Concluído no MVP user-mode |
 | RT-002 | Debounce e estabilidade | O monitor espera tamanho/mtime estáveis, coalesce eventos duplicados e limita a fila; arquivos em escrita parcial não são removidos. | Concluído no MVP user-mode |
-| RT-003 | Exclusões explícitas | Diretórios e extensões excluídos são validados, exibidos na GUI e não podem ignorar uma detecção por hash conhecido. | Planejado |
+| RT-003 | Exclusões explícitas | Diretórios e extensões excluídos são validados, exibidos na GUI e não podem ignorar uma detecção por hash conhecido. | Concluído no v0.3.0 |
 | RT-004 | Controle no dashboard | GUI mostra ativo/inativo, último evento, último scan e permite ligar/desligar sem mensagem alarmista. | Concluído no MVP user-mode |
 | QA-001 | Matriz de validação | Quick Scan, Custom Scan, YARA válido/inválido, EICAR em memória, quarentena, histórico, consulta de Release e falhas de integridade possuem testes reproduzíveis. | Parcial: baseline e realtime smoke aprovados; quarentena/update adversarial pendentes |
 | HIST-001 | Tela de histórico | Usuário consulta scans e detecções, com retenção/rotação documentada. | Planejado |
-| QUAR-001 | Quarentena reforçada | ACL restritiva, restauração somente por ação explícita, validação de hash e limpeza segura. | Planejado |
+| QUAR-001 | Quarentena reforçada | ACL restritiva, restauração somente por ação explícita, validação de hash e limpeza segura. | Concluído no v0.3.0 |
 
 ## P1 — endurecimento do produto
 
@@ -20,8 +20,8 @@ Este backlog transforma a documentação mestre em incrementos pequenos. Cada it
 | --- | --- | --- | --- |
 | RT-005 | Serviço Windows opcional | Serviço com recuperação após falha, privilégios mínimos, instalação/reparo/desinstalação e coexistência documentada com Defender. | Planejado |
 | RT-006 | Monitoramento de Downloads e startup | Pastas e itens de inicialização são observados sem remoção automática. | Planejado |
-| SCAN-001 | Full Scan | GUI permite selecionar unidades, pausar, continuar, cancelar e retomar com métricas. | Planejado |
-| SCAN-002 | Cache e scheduler | Cache por hash e agendamento com limites de CPU/I/O e logs. | Planejado |
+| SCAN-001 | Full Scan | GUI e CLI percorrem as raízes disponíveis, aplicam a política, registram métricas e mantêm a ação de quarentena explícita; controles de pausa/retomada ficam fora deste incremento. | Concluído no v0.3.0 |
+| SCAN-002 | Cache e scheduler | Cache SQLite por caminho, tamanho, mtime e chave do engine; scheduler intervalar com sinal de parada e histórico local. | Concluído no v0.3.0 |
 | PE-001 | Parser PE seguro | EXE/DLL/SYS têm arquitetura, sections, imports, entry point, timestamp, entropy e Authenticode lidos sem execução. | Planejado |
 | HEUR-001 | Heurísticas estáticas | Score explicável com baixa taxa de falsos positivos e testes de regressão. | Planejado |
 | UPD-001 | Assinatura Authenticode | Binários e updater assinados em CI por secret externo; nenhuma chave privada no Git. | Planejado |

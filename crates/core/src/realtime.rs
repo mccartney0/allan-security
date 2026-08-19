@@ -1,4 +1,4 @@
-use crate::{default_data_dir, ScanEngine, ScanSummary};
+use crate::{default_data_dir, policy::ExclusionPolicy, ScanEngine, ScanSummary};
 use anyhow::{anyhow, Context, Result};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
@@ -17,6 +17,7 @@ use std::{
 pub struct RealtimeConfig {
     pub paths: Vec<PathBuf>,
     pub excluded_paths: Vec<PathBuf>,
+    pub policy: ExclusionPolicy,
     pub debounce: Duration,
     pub stability_window: Duration,
     pub stability_attempts: u8,
@@ -33,9 +34,11 @@ impl RealtimeConfig {
             paths.push(profile.join("Desktop"));
         }
         let data_dir = default_data_dir();
+        let policy = ExclusionPolicy::load_default().unwrap_or_default();
         Self {
             paths,
             excluded_paths: vec![data_dir.join("quarantine"), data_dir.join("history.jsonl")],
+            policy,
             debounce: Duration::from_millis(600),
             stability_window: Duration::from_millis(250),
             stability_attempts: 8,
@@ -127,7 +130,7 @@ impl RealtimeMonitor {
                         continue;
                     }
                     for path in event.paths {
-                        if self.is_excluded(&path) || !is_candidate(&path) {
+                        if self.is_internal_excluded(&path) || !is_candidate(&path) {
                             continue;
                         }
                         if pending.len() >= self.config.max_pending_paths {
@@ -192,7 +195,7 @@ impl RealtimeMonitor {
         }
     }
 
-    fn is_excluded(&self, path: &Path) -> bool {
+    fn is_internal_excluded(&self, path: &Path) -> bool {
         self.config
             .excluded_paths
             .iter()
